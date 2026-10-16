@@ -1,0 +1,16 @@
+{
+  "name": "google-boot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": ["puppeteer", "google-flow", "automation", "image-generation"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer": "^25.14.0"
+  }
+}

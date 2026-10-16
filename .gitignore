@@ -1,0 +1,5 @@
+node_modules/
+chrome_user_data/
+downloaded_images/
+.env
+*.log

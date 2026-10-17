@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const puppeteer = require('puppeteer');
 
 // ==========================================
@@ -34,9 +35,6 @@ const CONFIG = {
   SETUP_PAUSE_SECONDS: 15,            // 15s parameter setup pause
   LOCKIN_BUFFER_SECONDS: 10,          // 10s buffer window to lock in custom UI toggles
 };
-
-// Global network response buffer for the active prompt
-let promptNetworkImages = [];
 
 // ==========================================
 // UTILITY FUNCTIONS
@@ -146,35 +144,6 @@ async function configureCdpDownloads(page, downloadPath = CONFIG.OUTPUT_DIR) {
   }
 }
 
-function attachNetworkResponseListener(page) {
-  page.on('response', async (response) => {
-    try {
-      const url = response.url();
-      const contentType = (response.headers()['content-type'] || '').toLowerCase();
-      if (
-        contentType.startsWith('image/') ||
-        url.includes('.png') ||
-        url.includes('.jpg') ||
-        url.includes('.jpeg') ||
-        url.includes('.webp') ||
-        url.includes('googleusercontent.com')
-      ) {
-        const buffer = await response.buffer().catch(() => null);
-        // Only keep substantial images (> 20KB) to skip tiny icons/avatars
-        if (buffer && buffer.length > 20480) {
-          promptNetworkImages.push({
-            url,
-            buffer,
-            contentType,
-            size: buffer.length,
-            time: Date.now(),
-          });
-        }
-      }
-    } catch (e) {}
-  });
-}
-
 async function launchBrowser() {
   console.log('🚀 Launching Chrome with dedicated profile (no blank page)...');
   ensureDirectoryExists(CONFIG.USER_DATA_DIR);
@@ -204,16 +173,12 @@ async function launchBrowser() {
   // Configure Native Browser Downloads to session OUTPUT_DIR (CDP)
   await configureCdpDownloads(page, CONFIG.OUTPUT_DIR);
 
-  // Attach network response listener for full image payloads
-  attachNetworkResponseListener(page);
-
   // Guard against any subsequent tabs created by Chrome/extensions
   browser.on('targetcreated', async (target) => {
     if (target.type() === 'page') {
       const newPage = await target.page().catch(() => null);
       if (newPage) {
         await configureCdpDownloads(newPage, CONFIG.OUTPUT_DIR);
-        attachNetworkResponseListener(newPage);
 
         if (newPage !== page && (newPage.url() === 'about:blank' || newPage.url() === '')) {
           setTimeout(async () => {
@@ -467,7 +432,6 @@ async function waitForWorkspaceReady(page) {
   await sleep(4000);
   await page.bringToFront().catch(() => {});
   await configureCdpDownloads(page, CONFIG.OUTPUT_DIR);
-  attachNetworkResponseListener(page);
   console.log(`✅ Fresh workspace ready at: ${page.url()}\n`);
 }
 
@@ -850,7 +814,7 @@ async function hardClearInput(page, inputElement) {
 // ==========================================
 // TYPE & 100% AUTOMATIC PROMPT SUBMISSION
 // ==========================================
-async function typeAndTriggerPrompt(page, inputElement, promptText) {
+async function typeAndTriggerPrompt(page, inputElement, promptText, onBeforeSubmit = null) {
   // 1. Ensure the prompt input element is actively focused
   await inputElement.focus();
   await sleep(100);
@@ -872,6 +836,11 @@ async function typeAndTriggerPrompt(page, inputElement, promptText) {
   // Re-ensure active focus right before pressing Enter
   await inputElement.focus();
   await sleep(100);
+
+  // Attach temporary listener and initialize capture buffers RIGHT BEFORE clicking Submit/Enter
+  if (typeof onBeforeSubmit === 'function') {
+    await onBeforeSubmit();
+  }
 
   // 2. Dispatch Enter keyboard events directly on the input element
   console.log('⌨️  Triggering Enter events directly on prompt input...');
@@ -1025,143 +994,473 @@ async function typeAndTriggerPrompt(page, inputElement, promptText) {
 }
 
 // ==========================================
-// PRE-PROMPT SNAPSHOT & DEEP DOM SCANNER
+// PRE-PROMPT BASELINE: MARK PRE-EXISTING ELEMENTS
 // ==========================================
-
 /**
- * Recursively retrieves all elements in the document and open shadow roots.
+ * Deeply tags all existing <img> and <canvas> elements currently in the DOM
+ * (including open shadow roots) with 'data-flow-preexisting="true"'.
+ * This guarantees that old project thumbnails, sidebar icons, and prior prompt turns
+ * are 100% ignored during scoped fallback extraction.
  */
-function getDomTraversalScript() {
-  return `
-    function getAllElements(root = document.body || document.documentElement) {
-      const elements = [];
-      function recurse(node) {
-        if (!node) return;
-        elements.push(node);
-        if (node.shadowRoot) {
-          recurse(node.shadowRoot);
-        }
-        const children = node.children || node.childNodes || [];
-        for (const child of children) {
-          if (child.nodeType === 1) {
-            recurse(child);
-          }
-        }
-      }
-      recurse(root);
-      return elements;
-    }
-  `;
-}
-
-/**
- * Scans the entire DOM (including open shadowRoots) and records a Set of unique signatures
- * (src URLs, dimensions, element references) for EVERY existing <img> and <canvas> currently on the page.
- */
-async function snapshotDOMImageSignatures(page) {
+async function markPreExistingElements(page) {
   try {
-    return await page.evaluate(() => {
-      const signatures = [];
-
+    const count = await page.evaluate(() => {
       function getAllElements(root = document.body || document.documentElement) {
-        const elements = [];
+        const list = [];
         function recurse(node) {
           if (!node) return;
-          elements.push(node);
-          if (node.shadowRoot) {
-            recurse(node.shadowRoot);
-          }
-          const children = node.children || node.childNodes || [];
-          for (const child of children) {
-            if (child.nodeType === 1) {
-              recurse(child);
-            }
+          list.push(node);
+          if (node.shadowRoot) recurse(node.shadowRoot);
+          const ch = node.children || node.childNodes || [];
+          for (const c of ch) {
+            if (c.nodeType === 1) recurse(c);
           }
         }
         recurse(root);
-        return elements;
+        return list;
+      }
+
+      const all = getAllElements();
+      let marked = 0;
+      for (const el of all) {
+        if (el.tagName === 'IMG' || el.tagName === 'CANVAS') {
+          el.setAttribute('data-flow-preexisting', 'true');
+          marked++;
+        }
+      }
+      return marked;
+    });
+    console.log(`🔒 Marked ${count} pre-existing image elements. Prior project/turn images will be strictly ignored.`);
+  } catch (err) {
+    console.warn(`⚠️ Warning marking pre-existing elements: ${err.message}`);
+  }
+}
+
+// ==========================================
+// API JSON BASE64 IMAGE EXTRACTOR
+// ==========================================
+/**
+ * Recursively inspects parsed JSON objects or strings to extract base64-encoded image payloads
+ * (e.g. imageBytes, b64_json, encodedImage, bytesBase64Encoded, or data:image/ URIs).
+ */
+function extractBase64ImagesFromTextOrJson(text) {
+  const buffers = [];
+  if (!text || typeof text !== 'string') return buffers;
+
+  let cleanText = text.trim();
+  // Strip XSSI prefix common in Google APIs (e.g. ")]}'\n")
+  if (cleanText.startsWith(")]}'")) {
+    cleanText = cleanText.replace(/^\)\]\}'/, '').trim();
+  }
+
+  function walkObject(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) {
+      for (const item of obj) walkObject(item);
+      return;
+    }
+    for (const [key, val] of Object.entries(obj)) {
+      if (typeof val === 'string') {
+        const lowerKey = key.toLowerCase();
+        if (
+          lowerKey.includes('imagebytes') ||
+          lowerKey.includes('b64_json') ||
+          lowerKey.includes('encodedimage') ||
+          lowerKey.includes('bytesbase64encoded') ||
+          val.startsWith('data:image/')
+        ) {
+          let b64 = val;
+          if (b64.includes('base64,')) {
+            b64 = b64.split('base64,')[1];
+          }
+          b64 = b64.replace(/\s+/g, '');
+          try {
+            const buf = Buffer.from(b64, 'base64');
+            // Generated images are always > 35 KB
+            if (buf.length >= 35000) {
+              buffers.push(buf);
+            }
+          } catch (e) {}
+        }
+      } else if (typeof val === 'object') {
+        walkObject(val);
+      }
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(cleanText);
+    walkObject(parsed);
+    if (buffers.length > 0) return buffers;
+  } catch (e) {
+    // If not standard single JSON, continue with regex extraction
+  }
+
+  // Regex fallback for JSON fields
+  const fieldRegex = /"(?:imageBytes|b64_json|encodedImage|bytesBase64Encoded)"\s*:\s*"([A-Za-z0-9+/=]{1000,})"/g;
+  let match;
+  while ((match = fieldRegex.exec(text)) !== null) {
+    try {
+      const buf = Buffer.from(match[1], 'base64');
+      if (buf.length >= 35000) {
+        buffers.push(buf);
+      }
+    } catch (e) {}
+  }
+
+  // Regex fallback for data URIs
+  const dataUriRegex = /data:image\/(?:png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]{1000,})/g;
+  while ((match = dataUriRegex.exec(text)) !== null) {
+    try {
+      const buf = Buffer.from(match[1], 'base64');
+      if (buf.length >= 35000) {
+        buffers.push(buf);
+      }
+    } catch (e) {}
+  }
+
+  return buffers;
+}
+
+// ==========================================
+// SCOPED LATEST-TURN FALLBACK (BLOB / MEMORY IMAGES)
+// ==========================================
+/**
+ * Queries ONLY the newly created generation card/container associated with the exact text
+ * of Prompt i (never scans the whole document or sidebar).
+ * For the 3 images inside that specific container, fetches their blob URLs inside page.evaluate
+ * ONLY if their element did not exist prior to submitting Prompt i.
+ */
+async function queryScopedContainerImages(page, promptText) {
+  try {
+    return await page.evaluate(async (text) => {
+      function getAllElements(root = document.body || document.documentElement) {
+        const list = [];
+        function rec(node) {
+          if (!node) return;
+          list.push(node);
+          if (node.shadowRoot) rec(node.shadowRoot);
+          const ch = node.children || node.childNodes || [];
+          for (const c of ch) {
+            if (c.nodeType === 1) rec(c);
+          }
+        }
+        rec(root);
+        return list;
+      }
+
+      function isSidebarOrNav(el) {
+        let curr = el;
+        while (curr) {
+          const tag = (curr.tagName || '').toLowerCase();
+          const role = (curr.getAttribute && curr.getAttribute('role')) || '';
+          const cls = (curr.className || '').toString().toLowerCase();
+          const id = (curr.id || '').toLowerCase();
+          if (
+            tag === 'nav' ||
+            tag === 'aside' ||
+            role === 'navigation' ||
+            cls.includes('sidebar') ||
+            cls.includes('nav') ||
+            cls.includes('drawer') ||
+            id.includes('sidebar') ||
+            id.includes('nav')
+          ) {
+            return true;
+          }
+          curr = curr.parentElement;
+        }
+        return false;
       }
 
       const allNodes = getAllElements();
-      for (const el of allNodes) {
-        if (el.tagName === 'IMG') {
-          const src = el.currentSrc || el.src;
-          if (src) {
-            signatures.push(src);
-            const w = el.naturalWidth || 0;
-            const h = el.naturalHeight || 0;
-            signatures.push(`${src}#${w}x${h}`);
-            const clean = src.split('?')[0];
-            if (clean && clean !== src) {
-              signatures.push(clean);
+      const cleanPrompt = text.trim();
+      const snippet = cleanPrompt.slice(0, 35);
+
+      // Locate non-sidebar text nodes matching the exact prompt
+      const matchingTextNodes = allNodes.filter((el) => {
+        if (isSidebarOrNav(el)) return false;
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable) return false;
+        const txt = el.innerText || el.textContent || '';
+        return txt.includes(cleanPrompt) || (snippet.length >= 10 && txt.includes(snippet));
+      });
+
+      let targetContainer = null;
+      // Ascend to the enclosing card/turn that contains non-preexisting images
+      for (const node of matchingTextNodes) {
+        let curr = node;
+        for (let depth = 0; depth < 10 && curr; depth++) {
+          if (curr.querySelectorAll) {
+            const newImages = Array.from(curr.querySelectorAll('img, canvas')).filter(
+              (img) => !img.hasAttribute('data-flow-preexisting')
+            );
+            if (newImages.length > 0) {
+              targetContainer = curr;
+              break;
             }
           }
-          if (el.id) signatures.push(`img_id:${el.id}`);
-        } else if (el.tagName === 'CANVAS') {
-          const w = el.width || 0;
-          const h = el.height || 0;
-          signatures.push(`canvas_${w}x${h}_${el.id || ''}`);
+          curr = curr.parentElement;
+        }
+        if (targetContainer) break;
+      }
+
+      // Fallback: If text match was truncated or stylized, look for the latest workspace turn outside nav
+      if (!targetContainer) {
+        for (let i = allNodes.length - 1; i >= 0; i--) {
+          const el = allNodes[i];
+          if (isSidebarOrNav(el)) continue;
+          if (el.querySelectorAll) {
+            const newImages = Array.from(el.querySelectorAll('img, canvas')).filter(
+              (img) => !img.hasAttribute('data-flow-preexisting')
+            );
+            if (newImages.length >= 3) {
+              targetContainer = el;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!targetContainer) {
+        return [];
+      }
+
+      // Query ONLY the images inside this specific container that did not exist before submitting
+      const candidateElements = Array.from(targetContainer.querySelectorAll('img, canvas')).filter(
+        (el) => !el.hasAttribute('data-flow-preexisting')
+      );
+
+      const dataUrls = [];
+      for (const el of candidateElements.slice(0, 3)) {
+        if (el.tagName === 'IMG') {
+          const src = el.currentSrc || el.src || '';
+          if (src.startsWith('blob:') || src.startsWith('http') || src.startsWith('data:image/')) {
+            try {
+              const res = await fetch(src, { credentials: 'include' });
+              const blob = await res.blob();
+              const readerResult = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+              });
+              if (readerResult && typeof readerResult === 'string' && readerResult.startsWith('data:image/')) {
+                dataUrls.push(readerResult);
+                continue;
+              }
+            } catch (fetchErr) {
+              // Fetch failed or blocked by CORS, proceed to canvas fallback
+            }
+          }
+
+          // Offscreen Canvas Draw Fallback
           try {
-            const snippet = el.toDataURL('image/png').slice(0, 150);
-            if (snippet) signatures.push(`canvas_data:${snippet}`);
+            const canvas = document.createElement('canvas');
+            const w = el.naturalWidth || el.width || 512;
+            const h = el.naturalHeight || el.height || 512;
+            if (w > 0 && h > 0) {
+              canvas.width = w;
+              canvas.height = h;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(el, 0, 0, w, h);
+              const dataUrl = canvas.toDataURL('image/png');
+              if (dataUrl && dataUrl.startsWith('data:image/')) {
+                dataUrls.push(dataUrl);
+              }
+            }
+          } catch (e) {}
+        } else if (el.tagName === 'CANVAS') {
+          try {
+            const dataUrl = el.toDataURL('image/png');
+            if (dataUrl && dataUrl.startsWith('data:image/')) {
+              dataUrls.push(dataUrl);
+            }
           } catch (e) {}
         }
       }
 
-      return signatures;
-    });
+      return dataUrls;
+    }, promptText);
   } catch (err) {
-    console.warn(`⚠️ Warning taking pre-prompt DOM snapshot: ${err.message}`);
+    console.warn(`⚠️ Scoped container fallback error: ${err.message}`);
     return [];
   }
 }
 
 // ==========================================
-// WAIT SPECIFICALLY FOR THE 3 NEW IMAGES
+// ACTIVE NETWORK RESPONSE INTERCEPTOR
 // ==========================================
-async function waitForNewImagesOfPrompt(page, knownImagesBeforePrompt, timeoutMs = CONFIG.GENERATION_TIMEOUT_MS) {
-  const startTime = Date.now();
-  console.log(`⏳ Waiting specifically for the 3 new images of current prompt (timeout: ${Math.round(timeoutMs / 1000)}s)...`);
+/**
+ * Attaches a temporary response interceptor to capture direct images (> 35KB) and API JSON base64 payloads.
+ * @param {import('puppeteer').Page} page
+ * @param {Set<string>} seenHashes Set of tracked URLs and image SHA256 hashes
+ * @param {Array<Buffer>} capturedBuffers Array of captured valid image buffers
+ * @returns {Function|null} the attached response handler
+ */
+function attachNetworkResponseListener(page, seenHashes = new Set(), capturedBuffers = []) {
+  if (!page) return null;
 
-  // Wait 3.5 seconds for UI state to transition into generating
-  await sleep(3500);
+  const responseHandler = async (response) => {
+    try {
+      const url = response.url() || '';
+      const headers = response.headers ? response.headers() : {};
+      const contentType = (headers['content-type'] || '').toLowerCase();
 
-  const knownArray = Array.from(knownImagesBeforePrompt);
-  let pollCount = 0;
-  let consecutiveReadyChecks = 0;
+      // A. Direct image responses (image/png, image/jpeg, image/webp, googleusercontent, etc.)
+      const isImageContentType =
+        contentType.startsWith('image/') ||
+        contentType.includes('image/png') ||
+        contentType.includes('image/jpeg') ||
+        contentType.includes('image/jpg') ||
+        contentType.includes('image/webp');
 
-  while (Date.now() - startTime < timeoutMs) {
-    pollCount++;
-    deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+      const isImageUrl =
+        /\.(png|jpe?g|webp)(\?.*)?$/i.test(url) ||
+        (url.includes('googleusercontent.com') && !url.includes('=s32') && !url.includes('=s64'));
 
-    const check = await page
-      .evaluate((knownList) => {
-        const knownSet = new Set(knownList);
-
-        function getAllElements(root = document.body || document.documentElement) {
-          const elements = [];
-          function recurse(node) {
-            if (!node) return;
-            elements.push(node);
-            if (node.shadowRoot) {
-              recurse(node.shadowRoot);
+      if (isImageContentType || isImageUrl) {
+        if (!seenHashes.has(url)) {
+          const buffer = await response.buffer().catch(() => null);
+          // Ignore tiny UI assets (buffer.length < 35000 bytes — generated images are always > 35 KB)
+          if (buffer && buffer.length >= 35000) {
+            const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+            if (!seenHashes.has(hash)) {
+              seenHashes.add(url);
+              seenHashes.add(hash);
+              capturedBuffers.push(buffer);
+              console.log(
+                `📥 [Network Intercept] Captured direct image #${capturedBuffers.length}/3 (${Math.round(buffer.length / 1024)} KB) from: ${url.slice(0, 75)}...`
+              );
             }
-            const children = node.children || node.childNodes || [];
-            for (const child of children) {
-              if (child.nodeType === 1) {
-                recurse(child);
+          }
+        }
+        return;
+      }
+
+      // B. Google Flow generation API JSON responses containing base64 encoded images
+      const isPotentialJsonOrApi =
+        contentType.includes('json') ||
+        contentType.includes('protobuf') ||
+        url.includes('generate') ||
+        url.includes('predict') ||
+        url.includes('batch') ||
+        url.includes('flow') ||
+        url.includes('fx');
+
+      if (isPotentialJsonOrApi) {
+        if (url.includes('google-analytics') || url.includes('play.google.com/log') || url.includes('doubleclick')) {
+          return;
+        }
+
+        const text = await response.text().catch(() => null);
+        if (
+          text &&
+          (text.includes('imageBytes') ||
+            text.includes('b64_json') ||
+            text.includes('encodedImage') ||
+            text.includes('bytesBase64Encoded') ||
+            text.includes('data:image/'))
+        ) {
+          const extracted = extractBase64ImagesFromTextOrJson(text);
+          for (const buf of extracted) {
+            if (buf.length >= 35000) {
+              const hash = crypto.createHash('sha256').update(buf).digest('hex');
+              if (!seenHashes.has(hash)) {
+                seenHashes.add(hash);
+                capturedBuffers.push(buf);
+                console.log(
+                  `📥 [Network Intercept] Extracted API base64 image #${capturedBuffers.length}/3 (${Math.round(buf.length / 1024)} KB)`
+                );
               }
             }
           }
-          recurse(root);
-          return elements;
+        }
+      }
+    } catch (e) {
+      // Safely ignore individual response aborts
+    }
+  };
+
+  page.on('response', responseHandler);
+  return responseHandler;
+}
+
+function detachNetworkResponseListener(page, responseHandler) {
+  if (!page || !responseHandler) return;
+  try {
+    if (page.off) {
+      page.off('response', responseHandler);
+    } else {
+      page.removeListener('response', responseHandler);
+    }
+  } catch (e) {}
+}
+
+// ==========================================
+// ACTIVE NETWORK INTERCEPTION & 3-PNG CAPTURE
+// ==========================================
+/**
+ * Strictly manages the active prompt generation window:
+ * 1. Attaches a temporary page.on('response') listener right BEFORE clicking Submit/Enter.
+ * 2. Captures direct image and API JSON base64 payloads, ignoring assets < 35KB.
+ * 3. Monitors generation completion and executes scoped turn fallback if fewer than 3 images.
+ * 4. Detaches listener in finally block.
+ * 5. Saves exactly 3 standalone PNGs per prompt (prompt_XX_img_Y.png) with KB sizes logged.
+ */
+async function generateAndCapturePromptImages(page, inputElement, promptText, promptNumber) {
+  ensureDirectoryExists(CONFIG.OUTPUT_DIR);
+  deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+
+  const capturedBuffers = [];
+  const seenKeys = new Set();
+  let responseHandler = null;
+
+  try {
+    // 1. Setup hook to initialize buffers and attach listener right BEFORE clicking Submit/Enter
+    const onBeforeSubmit = async () => {
+      console.log(`🎧 Attaching temporary network response listener for Prompt #${promptNumber}...`);
+      responseHandler = attachNetworkResponseListener(page, seenKeys, capturedBuffers);
+    };
+
+    // 2. Type prompt and trigger submission with active pre-submit hook
+    console.log('⌨️  Typing prompt and triggering 100% automatic submission...');
+    await typeAndTriggerPrompt(page, inputElement, promptText, onBeforeSubmit);
+
+    // 3. Active generation monitoring & network image capture
+    console.log(`⏳ Monitoring generation & network image capture (timeout: ${Math.round(CONFIG.GENERATION_TIMEOUT_MS / 1000)}s)...`);
+    const startTime = Date.now();
+    let generationFinishedTimestamp = null;
+    let pollCount = 0;
+
+    while (Date.now() - startTime < CONFIG.GENERATION_TIMEOUT_MS) {
+      pollCount++;
+      deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+
+      // Fast exit if all 3 images are captured via network
+      if (capturedBuffers.length >= 3) {
+        console.log(`🎯 Captured all 3 images via active network interception!`);
+        break;
+      }
+
+      // Check UI generation / busy status
+      const isBusy = await page.evaluate(() => {
+        function getAll(root = document.body || document.documentElement) {
+          const list = [];
+          function rec(n) {
+            if (!n) return;
+            list.push(n);
+            if (n.shadowRoot) rec(n.shadowRoot);
+            const ch = n.children || n.childNodes || [];
+            for (const c of ch) {
+              if (c.nodeType === 1) rec(c);
+            }
+          }
+          rec(root);
+          return list;
         }
 
-        const allNodes = getAllElements();
-
-        // 1. Check if generation / loading is active
-        let isBusy = false;
-        for (const el of allNodes) {
+        const nodes = getAll();
+        for (const el of nodes) {
           if (
             el.getAttribute &&
             (el.getAttribute('aria-busy') === 'true' ||
@@ -1173,475 +1472,94 @@ async function waitForNewImagesOfPrompt(page, knownImagesBeforePrompt, timeoutMs
               el.tagName === 'MAT-SPINNER' ||
               el.getAttribute('role') === 'progressbar')
           ) {
-            isBusy = true;
+            return true;
+          }
+        }
+        const text = (document.body ? document.body.innerText : '') || '';
+        return /generating\.\.\.|creating\.\.\.|thinking\.\.\./i.test(text);
+      }).catch(() => false);
+
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+      if (isBusy) {
+        generationFinishedTimestamp = null;
+        if (pollCount % 5 === 0) {
+          console.log(`   ⏳ Generating... ${elapsed}s elapsed | Captured: ${capturedBuffers.length}/3 images`);
+        }
+      } else {
+        if (elapsed >= 3) {
+          if (generationFinishedTimestamp === null) {
+            generationFinishedTimestamp = Date.now();
+            console.log(`🏁 Generation completed in UI at ${elapsed}s. Waiting for image payloads (captured: ${capturedBuffers.length}/3)...`);
+          }
+
+          const secondsSinceFinish = Math.round((Date.now() - generationFinishedTimestamp) / 1000);
+          if (capturedBuffers.length < 3 && secondsSinceFinish >= 45) {
+            console.log(`⚠️ Network listener captured ${capturedBuffers.length}/3 images within 45s after generation completed.`);
+            console.log(`🔄 Activating Scoped Latest-Turn Fallback (querying only container for Prompt #${promptNumber})...`);
             break;
           }
         }
-
-        if (!isBusy) {
-          const bodyText = (document.body ? document.body.innerText : '') || '';
-          if (/generating\.\.\.|creating\.\.\.|thinking\.\.\./i.test(bodyText)) {
-            isBusy = true;
-          }
-        }
-
-        // 2. Scan for brand new large images (naturalWidth >= 256, naturalHeight >= 256, complete === true)
-        const newImages = [];
-        for (const el of allNodes) {
-          if (el.tagName === 'IMG') {
-            if (!el.complete) continue;
-            const nw = el.naturalWidth || 0;
-            const nh = el.naturalHeight || 0;
-            // Ignore tiny avatars, icons, or sidebar thumbnails (width < 256)
-            if (nw < 256 || nh < 256) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.width < 100) continue;
-
-            const src = el.currentSrc || el.src || '';
-            if (!src) continue;
-
-            // Must NOT be in knownImagesBeforePrompt
-            if (knownSet.has(src)) continue;
-            if (knownSet.has(`${src}#${nw}x${nh}`)) continue;
-            const clean = src.split('?')[0];
-            if (clean && knownSet.has(clean)) continue;
-            if (el.id && knownSet.has(`img_id:${el.id}`)) continue;
-
-            newImages.push({
-              type: 'img',
-              src,
-              width: nw,
-              height: nh,
-            });
-          } else if (el.tagName === 'CANVAS') {
-            const w = el.width || 0;
-            const h = el.height || 0;
-            if (w < 256 || h < 256) continue;
-
-            const sig = `canvas_${w}x${h}_${el.id || ''}`;
-            if (knownSet.has(sig)) continue;
-
-            let dataSnippet = '';
-            try {
-              dataSnippet = el.toDataURL('image/png').slice(0, 150);
-              if (dataSnippet && knownSet.has(`canvas_data:${dataSnippet}`)) continue;
-            } catch (e) {}
-
-            newImages.push({
-              type: 'canvas',
-              src: dataSnippet,
-              width: w,
-              height: h,
-            });
-          }
-        }
-
-        return {
-          isBusy,
-          newImageCount: newImages.length,
-          samples: newImages.slice(0, 3).map((item) => `${item.type}:${item.width}x${item.height}`),
-        };
-      }, knownArray)
-      .catch(() => ({ isBusy: true, newImageCount: 0, samples: [] }));
-
-    if (pollCount % 4 === 0) {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(
-        `   ⏳ Polling: ${elapsed}s elapsed | New large images: ${check.newImageCount}/3 | UI busy: ${check.isBusy}`
-      );
-    }
-
-    // Condition: At least 3 brand new large images appear AND loading state finishes
-    if (check.newImageCount >= 3 && !check.isBusy) {
-      consecutiveReadyChecks++;
-      if (consecutiveReadyChecks >= 2) {
-        console.log(`🎯 3 brand new large images detected and loading finished!`);
-        console.log(`⏳ Waiting an extra 2.5s for high-resolution textures to finish rendering completely...`);
-        await sleep(2500);
-        return true;
       }
-    } else {
-      consecutiveReadyChecks = 0;
+
+      await sleep(1000);
     }
 
-    // Edge-case stability fallback: 3 new images arrived and stayed stable for multiple polls
-    if (check.newImageCount >= 3 && pollCount >= 10) {
-      console.log(`🎯 3 brand new large images detected and stable in DOM!`);
-      console.log(`⏳ Waiting an extra 2.5s for high-resolution textures to finish rendering completely...`);
-      await sleep(2500);
-      return true;
-    }
+    // 4. Scoped Latest-Turn Fallback if fewer than 3 images captured via network
+    if (capturedBuffers.length < 3) {
+      console.log(`🔍 [Scoped Fallback] Searching DOM specifically within the prompt card for: "${promptText.slice(0, 40)}..."`);
+      const fallbackDataUrls = await queryScopedContainerImages(page, promptText);
+      console.log(`🔍 [Scoped Fallback] Found ${fallbackDataUrls.length} newly rendered image(s) in prompt container.`);
 
-    await sleep(1200);
+      for (const dataUrl of fallbackDataUrls) {
+        if (capturedBuffers.length >= 3) break;
+        const base64Data = dataUrl.split(',')[1];
+        if (base64Data) {
+          const buf = Buffer.from(base64Data, 'base64');
+          if (buf.length >= 35000) {
+            const hash = crypto.createHash('sha256').update(buf).digest('hex');
+            if (!seenKeys.has(hash)) {
+              seenKeys.add(hash);
+              capturedBuffers.push(buf);
+              console.log(
+                `📥 [Scoped Fallback] Extracted container image #${capturedBuffers.length}/3 (${Math.round(buf.length / 1024)} KB)`
+              );
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    // 5. Detach listener as soon as prompt finishes or 3 images are captured
+    if (responseHandler) {
+      detachNetworkResponseListener(page, responseHandler);
+      console.log(`🔌 Detached network response listener for Prompt #${promptNumber}.`);
+    }
   }
 
-  console.warn('⚠️ Generation timeout reached. Proceeding with image extraction...');
-  return false;
-}
-
-// ==========================================
-// DIRECT INDIVIDUAL PNG EXTRACTION (ALL 3 IMAGES, NO ZIP)
-// ==========================================
-async function extractAndSaveNewImages(page, knownImagesBeforePrompt, promptNumber) {
-  ensureDirectoryExists(CONFIG.OUTPUT_DIR);
-  deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
-
+  // 6. Save up to 3 captured buffers directly to disk as individual PNG files (Strictly No ZIPs)
   const paddedIndex = String(promptNumber).padStart(2, '0');
   const savedFiles = [];
-  const knownArray = Array.from(knownImagesBeforePrompt);
 
-  console.log(`🔍 [PNG Extraction] Identifying 3 new generated images for Prompt #${promptNumber}...`);
-
-  // Step 1: Tag the 3 target newly generated images in the DOM
-  const tagResult = await page
-    .evaluate((knownList) => {
-      const knownSet = new Set(knownList);
-
-      function getAllElements(root = document.body || document.documentElement) {
-        const elements = [];
-        function recurse(node) {
-          if (!node) return;
-          elements.push(node);
-          if (node.shadowRoot) {
-            recurse(node.shadowRoot);
-          }
-          const children = node.children || node.childNodes || [];
-          for (const child of children) {
-            if (child.nodeType === 1) {
-              recurse(child);
-            }
-          }
-        }
-        recurse(root);
-        return elements;
-      }
-
-      const allNodes = getAllElements();
-
-      // Clear any prior tags
-      for (const el of allNodes) {
-        if (el.hasAttribute && el.hasAttribute('data-flow-new-image-index')) {
-          el.removeAttribute('data-flow-new-image-index');
-        }
-      }
-
-      const candidates = [];
-
-      for (const el of allNodes) {
-        if (el.tagName === 'IMG') {
-          if (!el.complete) continue;
-          const nw = el.naturalWidth || 0;
-          const nh = el.naturalHeight || 0;
-          if (nw < 256 || nh < 256) continue;
-
-          const rect = el.getBoundingClientRect();
-          if (rect.width > 0 && rect.width < 100) continue;
-
-          const src = el.currentSrc || el.src || '';
-          if (!src) continue;
-
-          if (knownSet.has(src)) continue;
-          if (knownSet.has(`${src}#${nw}x${nh}`)) continue;
-          const clean = src.split('?')[0];
-          if (clean && knownSet.has(clean)) continue;
-          if (el.id && knownSet.has(`img_id:${el.id}`)) continue;
-
-          candidates.push({
-            el,
-            src,
-            width: nw,
-            height: nh,
-            area: nw * nh,
-          });
-        } else if (el.tagName === 'CANVAS') {
-          const w = el.width || 0;
-          const h = el.height || 0;
-          if (w < 256 || h < 256) continue;
-
-          const sig = `canvas_${w}x${h}_${el.id || ''}`;
-          if (knownSet.has(sig)) continue;
-
-          let dataSnippet = '';
-          try {
-            dataSnippet = el.toDataURL('image/png').slice(0, 150);
-            if (dataSnippet && knownSet.has(`canvas_data:${dataSnippet}`)) continue;
-          } catch (e) {}
-
-          candidates.push({
-            el,
-            src: dataSnippet,
-            width: w,
-            height: h,
-            area: w * h,
-          });
-        }
-      }
-
-      // Take up to the 3 newly generated images (the latest batch in DOM order)
-      const targetBatch = candidates.slice(-3);
-
-      targetBatch.forEach((item, idx) => {
-        item.el.setAttribute('data-flow-new-image-index', String(idx));
-      });
-
-      return targetBatch.map((item, idx) => ({
-        index: idx,
-        src: item.src,
-        width: item.width,
-        height: item.height,
-      }));
-    }, knownArray)
-    .catch((err) => {
-      console.warn(`⚠️ Error identifying new images: ${err.message}`);
-      return [];
-    });
-
-  if (!tagResult || tagResult.length === 0) {
-    console.warn(`⚠️ No new images detected that pass the pre-prompt diff filter.`);
-    return [];
-  }
-
-  console.log(`🖼️ Tagged ${tagResult.length} new image(s) for direct PNG extraction.`);
-
-  // Step 2: Extract each of the 3 newly generated images directly as individual PNG files
-  for (let idx = 0; idx < tagResult.length; idx++) {
-    const imgIndex = idx + 1; // 1, 2, 3
+  for (let j = 0; j < Math.min(3, capturedBuffers.length); j++) {
+    const imgIndex = j + 1;
     const filename = `prompt_${paddedIndex}_img_${imgIndex}.png`;
     const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
+    const buf = capturedBuffers[j];
 
-    console.log(`\n📦 Extracting image ${imgIndex}/${tagResult.length} -> ${filename}...`);
-
-    let saved = false;
-
-    // --- 1. Direct browser-context extraction onto offscreen canvas ---
     try {
-      const canvasResult = await page.evaluate(async (targetIdx) => {
-        function findTagged(root = document.body || document.documentElement, index) {
-          if (!root) return null;
-          if (root.querySelector) {
-            const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
-            if (el) return el;
-          }
-          if (root.shadowRoot) {
-            const found = findTagged(root.shadowRoot, index);
-            if (found) return found;
-          }
-          const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-          for (const child of all) {
-            if (child.shadowRoot) {
-              const found = findTagged(child.shadowRoot, index);
-              if (found) return found;
-            }
-          }
-          return null;
-        }
-
-        const el = findTagged(document.body || document.documentElement, targetIdx);
-        if (!el) return { success: false, reason: 'not_found' };
-
-        try {
-          const canvas = document.createElement('canvas');
-          let w = el.naturalWidth || el.width;
-          let h = el.naturalHeight || el.height;
-          if (!w || !h) {
-            const rect = el.getBoundingClientRect();
-            w = Math.round(rect.width);
-            h = Math.round(rect.height);
-          }
-          canvas.width = w;
-          canvas.height = h;
-          const ctx = canvas.getContext('2d');
-          ctx.drawImage(el, 0, 0, w, h);
-          const dataUrl = canvas.toDataURL('image/png');
-          if (dataUrl && dataUrl.startsWith('data:image/png')) {
-            return {
-              success: true,
-              dataUrl,
-              src: el.currentSrc || el.src || '',
-              width: w,
-              height: h,
-            };
-          }
-        } catch (canvasErr) {
-          return { success: false, reason: 'canvas_tainted', error: canvasErr.message };
-        }
-
-        return { success: false, reason: 'canvas_failed' };
-      }, idx);
-
-      if (canvasResult && canvasResult.success && canvasResult.dataUrl) {
-        const base64Data = canvasResult.dataUrl.split(',')[1];
-        fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-        const displayPath = path.relative(process.cwd(), filePath);
-        console.log(`💾 Saved via Offscreen Canvas: ${displayPath} (${canvasResult.width}x${canvasResult.height})`);
-        savedFiles.push(filePath);
-        saved = true;
-
-        if (canvasResult.src) {
-          knownImagesBeforePrompt.add(canvasResult.src);
-          knownImagesBeforePrompt.add(`${canvasResult.src}#${canvasResult.width}x${canvasResult.height}`);
-        }
-      } else {
-        console.log(`   ℹ️ Canvas extraction blocked by CORS (${canvasResult?.reason || 'failed'}). Falling back to fetch...`);
-      }
-    } catch (e) {
-      console.log(`   ⚠️ Canvas extraction error: ${e.message}`);
-    }
-
-    // --- 2. In-Browser fetch(img.src) converted via FileReader ---
-    if (!saved) {
-      try {
-        const fetchResult = await page.evaluate(async (targetIdx) => {
-          function findTagged(root = document.body || document.documentElement, index) {
-            if (!root) return null;
-            if (root.querySelector) {
-              const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
-              if (el) return el;
-            }
-            if (root.shadowRoot) {
-              const found = findTagged(root.shadowRoot, index);
-              if (found) return found;
-            }
-            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-            for (const child of all) {
-              if (child.shadowRoot) {
-                const found = findTagged(child.shadowRoot, index);
-                if (found) return found;
-              }
-            }
-            return null;
-          }
-
-          const el = findTagged(document.body || document.documentElement, targetIdx);
-          if (!el) return { success: false, reason: 'not_found' };
-
-          const src = el.currentSrc || el.src;
-          if (!src) return { success: false, reason: 'no_src' };
-
-          try {
-            const res = await fetch(src, { credentials: 'include' });
-            const blob = await res.blob();
-            const dataUrl = await new Promise((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result);
-              reader.onerror = reject;
-              reader.readAsDataURL(blob);
-            });
-
-            if (dataUrl && typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-              return {
-                success: true,
-                dataUrl,
-                src,
-                width: el.naturalWidth || el.width,
-                height: el.naturalHeight || el.height,
-              };
-            }
-          } catch (fetchErr) {
-            return { success: false, reason: 'fetch_failed', error: fetchErr.message };
-          }
-
-          return { success: false, reason: 'fetch_invalid_data' };
-        }, idx);
-
-        if (fetchResult && fetchResult.success && fetchResult.dataUrl) {
-          const base64Data = fetchResult.dataUrl.split(',')[1];
-          fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-          const displayPath = path.relative(process.cwd(), filePath);
-          console.log(`💾 Saved via Browser Fetch: ${displayPath}`);
-          savedFiles.push(filePath);
-          saved = true;
-
-          if (fetchResult.src) {
-            knownImagesBeforePrompt.add(fetchResult.src);
-            knownImagesBeforePrompt.add(`${fetchResult.src}#${fetchResult.width}x${fetchResult.height}`);
-          }
-        } else {
-          console.log(`   ℹ️ Fetch fallback unavailable (${fetchResult?.reason || 'failed'}). Falling back to element screenshot...`);
-        }
-      } catch (e) {
-        console.log(`   ⚠️ Fetch extraction error: ${e.message}`);
-      }
-    }
-
-    // --- 3. Puppeteer Direct Element Screenshot (CORS-immune fallback) ---
-    if (!saved) {
-      try {
-        const handle = await page.evaluateHandle((targetIdx) => {
-          function findTagged(root = document.body || document.documentElement, index) {
-            if (!root) return null;
-            if (root.querySelector) {
-              const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
-              if (el) return el;
-            }
-            if (root.shadowRoot) {
-              const found = findTagged(root.shadowRoot, index);
-              if (found) return found;
-            }
-            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-            for (const child of all) {
-              if (child.shadowRoot) {
-                const found = findTagged(child.shadowRoot, index);
-                if (found) return found;
-              }
-            }
-            return null;
-          }
-          return findTagged(document.body || document.documentElement, targetIdx);
-        }, idx);
-
-        const element = handle ? handle.asElement() : null;
-        if (element) {
-          await element.scrollIntoView().catch(() => {});
-          await sleep(150);
-          await element.screenshot({ path: filePath, type: 'png' });
-          const displayPath = path.relative(process.cwd(), filePath);
-          console.log(`💾 Saved via Element Screenshot: ${displayPath}`);
-          savedFiles.push(filePath);
-          saved = true;
-        } else {
-          console.error(`❌ Could not locate element handle for image ${imgIndex}`);
-        }
-      } catch (e) {
-        console.error(`❌ Screenshot fallback error for image ${imgIndex}: ${e.message}`);
-      }
-    }
-
-    // Add metadata signatures to knownImagesBeforePrompt so future prompts ignore them
-    const itemMeta = tagResult[idx];
-    if (itemMeta && itemMeta.src) {
-      knownImagesBeforePrompt.add(itemMeta.src);
-      knownImagesBeforePrompt.add(`${itemMeta.src}#${itemMeta.width}x${itemMeta.height}`);
-      const clean = itemMeta.src.split('?')[0];
-      if (clean) knownImagesBeforePrompt.add(clean);
+      fs.writeFileSync(filePath, buf);
+      const sizeKb = Math.round(buf.length / 1024);
+      console.log(`💾 Saved ${filename} (${sizeKb} KB)`);
+      savedFiles.push(filePath);
+    } catch (saveErr) {
+      console.error(`❌ Error writing ${filename}: ${saveErr.message}`);
     }
   }
 
-  // Cleanup DOM tagging attributes
-  await page
-    .evaluate(() => {
-      function getAllElements(root = document.body || document.documentElement) {
-        const elements = [];
-        function recurse(node) {
-          if (!node) return;
-          elements.push(node);
-          if (node.shadowRoot) recurse(node.shadowRoot);
-          const children = node.children || node.childNodes || [];
-          for (const child of children) {
-            if (child.nodeType === 1) recurse(child);
-          }
-        }
-        recurse(root);
-        return elements;
-      }
-      for (const el of getAllElements()) {
-        if (el.hasAttribute && el.hasAttribute('data-flow-new-image-index')) {
-          el.removeAttribute('data-flow-new-image-index');
-        }
-      }
-    })
-    .catch(() => {});
+  if (savedFiles.length < 3) {
+    console.warn(`⚠️ Notice: Saved ${savedFiles.length}/3 images for prompt #${promptNumber}.`);
+  }
 
   deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
   return savedFiles;
@@ -1689,8 +1607,7 @@ async function main() {
     // 8. 10-second workspace lock-in window before processing queue
     await waitForWorkspaceLockin(CONFIG.LOCKIN_BUFFER_SECONDS);
 
-    // Initialize session-wide known image signatures set & active zip prevention
-    const knownImagesBeforePrompt = new Set();
+    // Initialize active zip prevention watcher
     const zipWatcher = startZipWatcher(CONFIG.OUTPUT_DIR);
     deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
 
@@ -1716,26 +1633,16 @@ async function main() {
         console.log('🧹 Clearing previous input text...');
         await hardClearInput(page, inputElement);
 
-        // Step 3: Strict Pre-Prompt Baseline Snapshot (Ignore Old Project Images)
+        // Step 3: Strict Pre-Prompt Baseline (Tag Existing Elements so Old Images are Ignored)
         deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
-        console.log('📸 Taking pre-prompt DOM baseline snapshot (recording all old project/history images to ignore)...');
-        const prePromptSignatures = await snapshotDOMImageSignatures(page);
-        for (const sig of prePromptSignatures) {
-          knownImagesBeforePrompt.add(sig);
-        }
-        console.log(`🔒 Baseline locked: ${knownImagesBeforePrompt.size} signatures recorded. Old/history images will be 100% ignored.`);
+        console.log('📸 Marking pre-prompt elements to ignore old project/turn images...');
+        await markPreExistingElements(page);
 
-        // Step 4: Type current prompt & trigger 100% automatic generation
-        console.log('⌨️  Typing prompt and triggering 100% automatic submission...');
-        await typeAndTriggerPrompt(page, inputElement, promptText);
-
-        // Step 5: Wait specifically for the 3 new images of the current prompt
-        await waitForNewImagesOfPrompt(page, knownImagesBeforePrompt, CONFIG.GENERATION_TIMEOUT_MS);
-
-        // Step 6: Direct Individual PNG Extraction (All 3 Images, Flat Folder, No ZIP)
-        const savedFiles = await extractAndSaveNewImages(
+        // Step 4 & 5: Active Network Interception & 3-PNG Capture (with Scoped Turn Fallback)
+        const savedFiles = await generateAndCapturePromptImages(
           page,
-          knownImagesBeforePrompt,
+          inputElement,
+          promptText,
           promptNumber
         );
         console.log(`🎉 Successfully saved ${savedFiles.length}/3 image(s) for prompt #${promptNumber}!`);
@@ -1743,7 +1650,7 @@ async function main() {
         // Final sanity cleanup of any zip files
         deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
 
-        // Step 7: Cooldown & continue
+        // Step 6: Cooldown & continue
         console.log(`⏱️  Cooling down for ${CONFIG.COOLDOWN_MS / 1000}s...`);
         await sleep(CONFIG.COOLDOWN_MS);
 

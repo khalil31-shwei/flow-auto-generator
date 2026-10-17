@@ -24,12 +24,11 @@ A robust, production-grade Node.js Puppeteer project designed to automate image 
 4. **Native CDP Download Behavior:**
    - Enables Chrome DevTools Protocol (`Page.setDownloadBehavior`) right at browser launch so any native download button or download link automatically saves files directly into the active session folder.
 
-5. **Multi-Layered Bulletproof Image Extraction:**
-   - **Layer 1: Native UI Download Trigger:** Clicks the card's native download button/icon in Google Flow, capturing the full-resolution file via CDP into the session directory and auto-renaming it to `prompt_XX_img_Y.png`.
-   - **Layer 2: Deep DOM In-Browser Fetch & Blob Conversion:** Recursively traverses shadow roots, custom elements, `<canvas>`, and background images to fetch and convert image data.
-   - **Layer 3: Direct Element Compositor Screenshot:** Takes a direct Puppeteer screenshot (`handle.screenshot()`) of the image element or card, completely immune to CORS, canvas security restrictions, or opaque responses.
-   - **Layer 4: Network Response Interceptor:** Intercepts raw image HTTP response buffers (`image/png`, `image/webp`, `googleusercontent.com`) directly from Chrome's network stream.
-   - **Layer 5: Viewport Fallback Snapshot:** Captures the workspace card area as a final safety net.
+5. **Active Network Response Interception & Scoped Fallback:**
+   - **Strict Network Window Per Prompt:** Network response listening is strictly limited to the active generation window of each prompt (never during page load or dashboard navigation).
+   - **Direct Full-Size Image Payloads:** Captures direct image responses (`image/png`, `image/jpeg`, `image/webp`, `googleusercontent.com`) and generation API JSON base64 payloads (`imageBytes`, `b64_json`, `encodedImage`), strictly ignoring small UI assets (< 35 KB).
+   - **Scoped Latest-Turn Fallback:** If network capture yields fewer than 3 images within 45s of generation completion, queries ONLY the newly created container for the active prompt (ignoring sidebar/nav) to extract newly rendered blob images.
+   - **Direct Standalone PNGs:** Writes images directly as `prompt_XX_img_Y.png` with file sizes logged to console. Strictly avoids UI zip downloads.
 
 6. **100% Automatic Hands-Free Submission:**
    - Actively focuses the input element.

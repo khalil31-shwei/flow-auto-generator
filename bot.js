@@ -84,49 +84,49 @@ function getDirectoryFiles(dirPath) {
   return fs.readdirSync(dirPath);
 }
 
-async function waitForDownloadedFiles(dirPath, baselineFiles, timeoutMs = 6000) {
-  const startTime = Date.now();
-  const baselineSet = new Set(baselineFiles);
-
-  while (Date.now() - startTime < timeoutMs) {
-    const current = getDirectoryFiles(dirPath);
-    const newFiles = current.filter((f) => !baselineSet.has(f));
-
-    // Wait until .crdownload or .tmp is finished
-    const stillDownloading = newFiles.some((f) => f.endsWith('.crdownload') || f.endsWith('.tmp'));
-    if (newFiles.length > 0 && !stillDownloading) {
-      return newFiles;
-    }
-    await sleep(500);
-  }
-  return [];
-}
-
-function renameDownloadedFiles(dirPath, newFiles, promptNumber) {
-  const paddedIndex = String(promptNumber).padStart(2, '0');
-  const renamed = [];
-
-  for (let k = 0; k < newFiles.length; k++) {
-    const oldName = newFiles[k];
-    const oldPath = path.join(dirPath, oldName);
-    const ext = path.extname(oldName) || '.png';
-    const cleanExt = ext.toLowerCase() === '.crdownload' ? '.png' : ext;
-    const newName = `prompt_${paddedIndex}_img_${k + 1}${cleanExt}`;
-    const newPath = path.join(dirPath, newName);
-
-    try {
-      if (oldPath !== newPath) {
-        fs.renameSync(oldPath, newPath);
+function deleteAnyZipFiles(dirPath) {
+  try {
+    if (!fs.existsSync(dirPath)) return;
+    const files = fs.readdirSync(dirPath);
+    for (const file of files) {
+      const lower = file.toLowerCase();
+      if (lower.endsWith('.zip') || (lower.endsWith('.crdownload') && lower.includes('.zip'))) {
+        const fullPath = path.join(dirPath, file);
+        try {
+          fs.unlinkSync(fullPath);
+          console.log(`🗑️ Deleted unwanted zip archive immediately: ${file}`);
+        } catch (e) {
+          console.warn(`⚠️ Could not delete zip archive ${file}: ${e.message}`);
+        }
       }
-      const displayPath = path.relative(process.cwd(), newPath);
-      console.log(`💾 Saved via native download: ${displayPath}`);
-      renamed.push(newPath);
-    } catch (e) {
-      console.warn(`⚠️ Could not rename ${oldName}: ${e.message}`);
     }
+  } catch (err) {
+    console.warn(`⚠️ Error checking zip files: ${err.message}`);
   }
-  return renamed;
 }
+
+function startZipWatcher(dirPath) {
+  try {
+    ensureDirectoryExists(dirPath);
+    return fs.watch(dirPath, (eventType, filename) => {
+      if (!filename) return;
+      const lower = filename.toLowerCase();
+      if (lower.endsWith('.zip') || (lower.endsWith('.crdownload') && lower.includes('.zip'))) {
+        const fullPath = path.join(dirPath, filename);
+        try {
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+            console.log(`🗑️ [Watcher] Deleted unwanted zip archive immediately: ${filename}`);
+          }
+        } catch (e) {}
+      }
+    });
+  } catch (err) {
+    console.warn(`⚠️ Warning setting up zip watcher: ${err.message}`);
+    return null;
+  }
+}
+
 
 // ==========================================
 // BROWSER INITIALIZATION & CDP CONFIGURATION
@@ -1025,394 +1025,625 @@ async function typeAndTriggerPrompt(page, inputElement, promptText) {
 }
 
 // ==========================================
-// DEEP DOM IMAGE SCANNER (Shadow Roots, Canvas, Bg)
+// PRE-PROMPT SNAPSHOT & DEEP DOM SCANNER
 // ==========================================
-async function getDeepDOMImages(page) {
-  return await page
-    .evaluate(() => {
-      const collected = [];
-      const seenUrls = new Set();
 
-      function isLikelyGeneratedArtwork(w, h, src) {
-        if ((w && w < 100) || (h && h < 100)) return false;
-        if (src) {
-          const lower = src.toLowerCase();
-          if (
-            lower.includes('favicon') ||
-            lower.includes('avatar') ||
-            lower.includes('profile') ||
-            lower.includes('emoji') ||
-            lower.includes('icon_')
-          ) {
-            return false;
-          }
-        }
-        return true;
-      }
-
-      function inspectElement(el) {
-        if (!el) return;
-
-        // 1. Check img tags
-        if (el.tagName === 'IMG') {
-          const src = el.currentSrc || el.src;
-          if (src && !seenUrls.has(src)) {
-            const rect = el.getBoundingClientRect();
-            const w = el.naturalWidth || rect.width;
-            const h = el.naturalHeight || rect.height;
-            if (isLikelyGeneratedArtwork(w, h, src)) {
-              seenUrls.add(src);
-              collected.push({
-                type: 'img',
-                src,
-                width: w,
-                height: h,
-                id: el.id,
-                className: el.className,
-              });
-            }
-          }
-        }
-
-        // 2. Check canvas
-        if (el.tagName === 'CANVAS') {
-          if (el.width > 100 && el.height > 100) {
-            try {
-              const dataUrl = el.toDataURL('image/png');
-              if (dataUrl && dataUrl.length > 2000 && !seenUrls.has(dataUrl.slice(0, 100))) {
-                seenUrls.add(dataUrl.slice(0, 100));
-                collected.push({
-                  type: 'canvas',
-                  src: dataUrl,
-                  width: el.width,
-                  height: el.height,
-                });
-              }
-            } catch (e) {}
-          }
-        }
-
-        // 3. Check CSS background-image
-        const style = window.getComputedStyle(el);
-        const bg = style.backgroundImage;
-        if (bg && bg.startsWith('url(')) {
-          const match = bg.match(/url\(["']?(.*?)["']?\)/);
-          if (match && match[1] && !seenUrls.has(match[1])) {
-            const rect = el.getBoundingClientRect();
-            if (isLikelyGeneratedArtwork(rect.width, rect.height, match[1])) {
-              seenUrls.add(match[1]);
-              collected.push({
-                type: 'background',
-                src: match[1],
-                width: rect.width,
-                height: rect.height,
-              });
-            }
-          }
-        }
-
-        // 4. Recursive Shadow Root traversal
-        if (el.shadowRoot) {
-          traverse(el.shadowRoot);
-        }
-      }
-
-      function traverse(node) {
+/**
+ * Recursively retrieves all elements in the document and open shadow roots.
+ */
+function getDomTraversalScript() {
+  return `
+    function getAllElements(root = document.body || document.documentElement) {
+      const elements = [];
+      function recurse(node) {
         if (!node) return;
-        inspectElement(node);
+        elements.push(node);
+        if (node.shadowRoot) {
+          recurse(node.shadowRoot);
+        }
         const children = node.children || node.childNodes || [];
         for (const child of children) {
           if (child.nodeType === 1) {
-            traverse(child);
+            recurse(child);
           }
         }
       }
+      recurse(root);
+      return elements;
+    }
+  `;
+}
 
-      traverse(document.body || document.documentElement);
-      return collected;
-    })
-    .catch(() => []);
+/**
+ * Scans the entire DOM (including open shadowRoots) and records a Set of unique signatures
+ * (src URLs, dimensions, element references) for EVERY existing <img> and <canvas> currently on the page.
+ */
+async function snapshotDOMImageSignatures(page) {
+  try {
+    return await page.evaluate(() => {
+      const signatures = [];
+
+      function getAllElements(root = document.body || document.documentElement) {
+        const elements = [];
+        function recurse(node) {
+          if (!node) return;
+          elements.push(node);
+          if (node.shadowRoot) {
+            recurse(node.shadowRoot);
+          }
+          const children = node.children || node.childNodes || [];
+          for (const child of children) {
+            if (child.nodeType === 1) {
+              recurse(child);
+            }
+          }
+        }
+        recurse(root);
+        return elements;
+      }
+
+      const allNodes = getAllElements();
+      for (const el of allNodes) {
+        if (el.tagName === 'IMG') {
+          const src = el.currentSrc || el.src;
+          if (src) {
+            signatures.push(src);
+            const w = el.naturalWidth || 0;
+            const h = el.naturalHeight || 0;
+            signatures.push(`${src}#${w}x${h}`);
+            const clean = src.split('?')[0];
+            if (clean && clean !== src) {
+              signatures.push(clean);
+            }
+          }
+          if (el.id) signatures.push(`img_id:${el.id}`);
+        } else if (el.tagName === 'CANVAS') {
+          const w = el.width || 0;
+          const h = el.height || 0;
+          signatures.push(`canvas_${w}x${h}_${el.id || ''}`);
+          try {
+            const snippet = el.toDataURL('image/png').slice(0, 150);
+            if (snippet) signatures.push(`canvas_data:${snippet}`);
+          } catch (e) {}
+        }
+      }
+
+      return signatures;
+    });
+  } catch (err) {
+    console.warn(`⚠️ Warning taking pre-prompt DOM snapshot: ${err.message}`);
+    return [];
+  }
 }
 
 // ==========================================
-// SMART WAIT FOR GENERATION COMPLETION
+// WAIT SPECIFICALLY FOR THE 3 NEW IMAGES
 // ==========================================
-async function waitForGenerationToFinish(page, baselineImgCount, timeoutMs = CONFIG.GENERATION_TIMEOUT_MS) {
+async function waitForNewImagesOfPrompt(page, knownImagesBeforePrompt, timeoutMs = CONFIG.GENERATION_TIMEOUT_MS) {
   const startTime = Date.now();
-  console.log(`⏳ Monitoring generation completion (timeout: ${Math.round(timeoutMs / 1000)}s)...`);
+  console.log(`⏳ Waiting specifically for the 3 new images of current prompt (timeout: ${Math.round(timeoutMs / 1000)}s)...`);
 
-  // Wait 4 seconds for generation pipeline to initialize
-  await sleep(4000);
+  // Wait 3.5 seconds for UI state to transition into generating
+  await sleep(3500);
 
+  const knownArray = Array.from(knownImagesBeforePrompt);
   let pollCount = 0;
+  let consecutiveReadyChecks = 0;
+
   while (Date.now() - startTime < timeoutMs) {
     pollCount++;
-    await sleep(2000);
+    deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
 
-    const status = await page
-      .evaluate(() => {
-        const busy =
-          !!document.querySelector(
-            '[aria-busy="true"], .generating, .loading, [data-state="generating"], mat-progress-bar, mat-spinner, [role="progressbar"]'
-          ) || /generating\.\.\.|creating\.\.\.|thinking\.\.\./i.test(document.body ? document.body.innerText : '');
+    const check = await page
+      .evaluate((knownList) => {
+        const knownSet = new Set(knownList);
 
-        return { busy };
-      })
-      .catch(() => ({ busy: false }));
+        function getAllElements(root = document.body || document.documentElement) {
+          const elements = [];
+          function recurse(node) {
+            if (!node) return;
+            elements.push(node);
+            if (node.shadowRoot) {
+              recurse(node.shadowRoot);
+            }
+            const children = node.children || node.childNodes || [];
+            for (const child of children) {
+              if (child.nodeType === 1) {
+                recurse(child);
+              }
+            }
+          }
+          recurse(root);
+          return elements;
+        }
 
-    const currentImgs = await getDeepDOMImages(page);
-    const newNetworkArrived = promptNetworkImages.length > 0;
-    const newDomArrived = currentImgs.length > baselineImgCount;
+        const allNodes = getAllElements();
 
-    if (pollCount % 5 === 0) {
+        // 1. Check if generation / loading is active
+        let isBusy = false;
+        for (const el of allNodes) {
+          if (
+            el.getAttribute &&
+            (el.getAttribute('aria-busy') === 'true' ||
+              el.getAttribute('data-state') === 'generating' ||
+              el.classList.contains('generating') ||
+              el.classList.contains('loading') ||
+              el.classList.contains('spinner') ||
+              el.tagName === 'MAT-PROGRESS-BAR' ||
+              el.tagName === 'MAT-SPINNER' ||
+              el.getAttribute('role') === 'progressbar')
+          ) {
+            isBusy = true;
+            break;
+          }
+        }
+
+        if (!isBusy) {
+          const bodyText = (document.body ? document.body.innerText : '') || '';
+          if (/generating\.\.\.|creating\.\.\.|thinking\.\.\./i.test(bodyText)) {
+            isBusy = true;
+          }
+        }
+
+        // 2. Scan for brand new large images (naturalWidth >= 256, naturalHeight >= 256, complete === true)
+        const newImages = [];
+        for (const el of allNodes) {
+          if (el.tagName === 'IMG') {
+            if (!el.complete) continue;
+            const nw = el.naturalWidth || 0;
+            const nh = el.naturalHeight || 0;
+            // Ignore tiny avatars, icons, or sidebar thumbnails (width < 256)
+            if (nw < 256 || nh < 256) continue;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.width < 100) continue;
+
+            const src = el.currentSrc || el.src || '';
+            if (!src) continue;
+
+            // Must NOT be in knownImagesBeforePrompt
+            if (knownSet.has(src)) continue;
+            if (knownSet.has(`${src}#${nw}x${nh}`)) continue;
+            const clean = src.split('?')[0];
+            if (clean && knownSet.has(clean)) continue;
+            if (el.id && knownSet.has(`img_id:${el.id}`)) continue;
+
+            newImages.push({
+              type: 'img',
+              src,
+              width: nw,
+              height: nh,
+            });
+          } else if (el.tagName === 'CANVAS') {
+            const w = el.width || 0;
+            const h = el.height || 0;
+            if (w < 256 || h < 256) continue;
+
+            const sig = `canvas_${w}x${h}_${el.id || ''}`;
+            if (knownSet.has(sig)) continue;
+
+            let dataSnippet = '';
+            try {
+              dataSnippet = el.toDataURL('image/png').slice(0, 150);
+              if (dataSnippet && knownSet.has(`canvas_data:${dataSnippet}`)) continue;
+            } catch (e) {}
+
+            newImages.push({
+              type: 'canvas',
+              src: dataSnippet,
+              width: w,
+              height: h,
+            });
+          }
+        }
+
+        return {
+          isBusy,
+          newImageCount: newImages.length,
+          samples: newImages.slice(0, 3).map((item) => `${item.type}:${item.width}x${item.height}`),
+        };
+      }, knownArray)
+      .catch(() => ({ isBusy: true, newImageCount: 0, samples: [] }));
+
+    if (pollCount % 4 === 0) {
       const elapsed = Math.round((Date.now() - startTime) / 1000);
       console.log(
-        `   ⏳ Still generating... (${elapsed}s elapsed, DOM images: ${currentImgs.length}, network images: ${promptNetworkImages.length})`
+        `   ⏳ Polling: ${elapsed}s elapsed | New large images: ${check.newImageCount}/3 | UI busy: ${check.isBusy}`
       );
     }
 
-    // Finished if idle and new content arrived (or after reasonable window)
-    if (!status.busy && (newDomArrived || newNetworkArrived || pollCount >= 10)) {
-      console.log('✨ Generation complete! Allowing 3s for render stabilization...');
-      await sleep(3000);
+    // Condition: At least 3 brand new large images appear AND loading state finishes
+    if (check.newImageCount >= 3 && !check.isBusy) {
+      consecutiveReadyChecks++;
+      if (consecutiveReadyChecks >= 2) {
+        console.log(`🎯 3 brand new large images detected and loading finished!`);
+        console.log(`⏳ Waiting an extra 2.5s for high-resolution textures to finish rendering completely...`);
+        await sleep(2500);
+        return true;
+      }
+    } else {
+      consecutiveReadyChecks = 0;
+    }
+
+    // Edge-case stability fallback: 3 new images arrived and stayed stable for multiple polls
+    if (check.newImageCount >= 3 && pollCount >= 10) {
+      console.log(`🎯 3 brand new large images detected and stable in DOM!`);
+      console.log(`⏳ Waiting an extra 2.5s for high-resolution textures to finish rendering completely...`);
+      await sleep(2500);
       return true;
     }
+
+    await sleep(1200);
   }
 
-  console.warn('⚠️ Generation wait window reached. Proceeding with multi-layered extraction...');
+  console.warn('⚠️ Generation timeout reached. Proceeding with image extraction...');
   return false;
 }
 
 // ==========================================
-// MULTI-LAYERED BULLETPROOF IMAGE EXTRACTION
+// DIRECT INDIVIDUAL PNG EXTRACTION (ALL 3 IMAGES, NO ZIP)
 // ==========================================
-async function captureAndSaveGeneratedImages(page, baselineImages, baselineFiles, promptNumber) {
+async function extractAndSaveNewImages(page, knownImagesBeforePrompt, promptNumber) {
   ensureDirectoryExists(CONFIG.OUTPUT_DIR);
+  deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+
   const paddedIndex = String(promptNumber).padStart(2, '0');
   const savedFiles = [];
+  const knownArray = Array.from(knownImagesBeforePrompt);
 
-  // ==========================================
-  // LAYER 1: Native UI Download Button Click (CDP)
-  // ==========================================
-  console.log('🔍 [Layer 1] Checking for native UI Download button in Google Flow...');
-  try {
-    const clicked = await page.evaluate(() => {
-      const isVisible = (el) => {
-        if (!el) return false;
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0;
-      };
+  console.log(`🔍 [PNG Extraction] Identifying 3 new generated images for Prompt #${promptNumber}...`);
 
-      // 1. Check all buttons for "download"
-      const allButtons = Array.from(document.querySelectorAll('button, [role="button"], a[download]'));
-      const downloadBtns = allButtons.filter((b) => {
-        const text = (b.innerText || b.getAttribute('aria-label') || b.title || '').toLowerCase();
-        return (
-          isVisible(b) &&
-          (/download/i.test(text) ||
-            b.querySelector('svg[data-icon*="download"], [aria-label*="download" i]') !== null)
-        );
-      });
+  // Step 1: Tag the 3 target newly generated images in the DOM
+  const tagResult = await page
+    .evaluate((knownList) => {
+      const knownSet = new Set(knownList);
 
-      if (downloadBtns.length > 0) {
-        const latestBtn = downloadBtns[downloadBtns.length - 1];
-        latestBtn.scrollIntoView({ behavior: 'instant', block: 'nearest' });
-        latestBtn.click();
-        return { clicked: true, method: 'direct_button' };
+      function getAllElements(root = document.body || document.documentElement) {
+        const elements = [];
+        function recurse(node) {
+          if (!node) return;
+          elements.push(node);
+          if (node.shadowRoot) {
+            recurse(node.shadowRoot);
+          }
+          const children = node.children || node.childNodes || [];
+          for (const child of children) {
+            if (child.nodeType === 1) {
+              recurse(child);
+            }
+          }
+        }
+        recurse(root);
+        return elements;
       }
 
-      // 2. Hover over the newest image card to reveal download button
-      const imageCards = Array.from(
-        document.querySelectorAll('img, [role="img"], [data-testid*="image"], [class*="card"]')
-      ).filter((el) => {
-        const rect = el.getBoundingClientRect();
-        return isVisible(el) && rect.width > 120 && rect.height > 120;
-      });
+      const allNodes = getAllElements();
 
-      if (imageCards.length > 0) {
-        const newestCard = imageCards[imageCards.length - 1];
-        newestCard.scrollIntoView({ behavior: 'instant', block: 'nearest' });
-        newestCard.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-        newestCard.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-
-        const hoverButtons = Array.from(document.querySelectorAll('button, [role="button"], a[download]')).filter(
-          (b) => {
-            const text = (b.innerText || b.getAttribute('aria-label') || b.title || '').toLowerCase();
-            return isVisible(b) && /download/i.test(text);
-          }
-        );
-
-        if (hoverButtons.length > 0) {
-          hoverButtons[hoverButtons.length - 1].click();
-          return { clicked: true, method: 'hover_button' };
+      // Clear any prior tags
+      for (const el of allNodes) {
+        if (el.hasAttribute && el.hasAttribute('data-flow-new-image-index')) {
+          el.removeAttribute('data-flow-new-image-index');
         }
       }
 
-      return { clicked: false };
+      const candidates = [];
+
+      for (const el of allNodes) {
+        if (el.tagName === 'IMG') {
+          if (!el.complete) continue;
+          const nw = el.naturalWidth || 0;
+          const nh = el.naturalHeight || 0;
+          if (nw < 256 || nh < 256) continue;
+
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.width < 100) continue;
+
+          const src = el.currentSrc || el.src || '';
+          if (!src) continue;
+
+          if (knownSet.has(src)) continue;
+          if (knownSet.has(`${src}#${nw}x${nh}`)) continue;
+          const clean = src.split('?')[0];
+          if (clean && knownSet.has(clean)) continue;
+          if (el.id && knownSet.has(`img_id:${el.id}`)) continue;
+
+          candidates.push({
+            el,
+            src,
+            width: nw,
+            height: nh,
+            area: nw * nh,
+          });
+        } else if (el.tagName === 'CANVAS') {
+          const w = el.width || 0;
+          const h = el.height || 0;
+          if (w < 256 || h < 256) continue;
+
+          const sig = `canvas_${w}x${h}_${el.id || ''}`;
+          if (knownSet.has(sig)) continue;
+
+          let dataSnippet = '';
+          try {
+            dataSnippet = el.toDataURL('image/png').slice(0, 150);
+            if (dataSnippet && knownSet.has(`canvas_data:${dataSnippet}`)) continue;
+          } catch (e) {}
+
+          candidates.push({
+            el,
+            src: dataSnippet,
+            width: w,
+            height: h,
+            area: w * h,
+          });
+        }
+      }
+
+      // Take up to the 3 newly generated images (the latest batch in DOM order)
+      const targetBatch = candidates.slice(-3);
+
+      targetBatch.forEach((item, idx) => {
+        item.el.setAttribute('data-flow-new-image-index', String(idx));
+      });
+
+      return targetBatch.map((item, idx) => ({
+        index: idx,
+        src: item.src,
+        width: item.width,
+        height: item.height,
+      }));
+    }, knownArray)
+    .catch((err) => {
+      console.warn(`⚠️ Error identifying new images: ${err.message}`);
+      return [];
     });
 
-    if (clicked.clicked) {
-      console.log(`   🖱️ Triggered UI download (${clicked.method}). Waiting for file via CDP...`);
-      const newFiles = await waitForDownloadedFiles(CONFIG.OUTPUT_DIR, baselineFiles, 5000);
-      if (newFiles.length > 0) {
-        const renamed = renameDownloadedFiles(CONFIG.OUTPUT_DIR, newFiles, promptNumber);
-        if (renamed.length > 0) {
-          return renamed;
-        }
-      }
-    }
-  } catch (err) {
-    console.log(`   ⚠️ Layer 1 note: ${err.message}`);
+  if (!tagResult || tagResult.length === 0) {
+    console.warn(`⚠️ No new images detected that pass the pre-prompt diff filter.`);
+    return [];
   }
 
-  // ==========================================
-  // LAYER 2: In-Browser Fetch & Blob Conversion
-  // ==========================================
-  console.log('🔍 [Layer 2] Deep DOM image search & browser fetch extraction...');
-  try {
-    const baselineSrcSet = new Set(baselineImages.map((img) => img.src));
-    const currentDeepImages = await getDeepDOMImages(page);
-    let targetImages = currentDeepImages.filter((img) => !baselineSrcSet.has(img.src));
+  console.log(`🖼️ Tagged ${tagResult.length} new image(s) for direct PNG extraction.`);
 
-    // If no new URLs, take the latest generated images by size
-    if (targetImages.length === 0 && currentDeepImages.length > 0) {
-      targetImages = [currentDeepImages[currentDeepImages.length - 1]];
+  // Step 2: Extract each of the 3 newly generated images directly as individual PNG files
+  for (let idx = 0; idx < tagResult.length; idx++) {
+    const imgIndex = idx + 1; // 1, 2, 3
+    const filename = `prompt_${paddedIndex}_img_${imgIndex}.png`;
+    const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
+
+    console.log(`\n📦 Extracting image ${imgIndex}/${tagResult.length} -> ${filename}...`);
+
+    let saved = false;
+
+    // --- 1. Direct browser-context extraction onto offscreen canvas ---
+    try {
+      const canvasResult = await page.evaluate(async (targetIdx) => {
+        function findTagged(root = document.body || document.documentElement, index) {
+          if (!root) return null;
+          if (root.querySelector) {
+            const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
+            if (el) return el;
+          }
+          if (root.shadowRoot) {
+            const found = findTagged(root.shadowRoot, index);
+            if (found) return found;
+          }
+          const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+          for (const child of all) {
+            if (child.shadowRoot) {
+              const found = findTagged(child.shadowRoot, index);
+              if (found) return found;
+            }
+          }
+          return null;
+        }
+
+        const el = findTagged(document.body || document.documentElement, targetIdx);
+        if (!el) return { success: false, reason: 'not_found' };
+
+        try {
+          const canvas = document.createElement('canvas');
+          let w = el.naturalWidth || el.width;
+          let h = el.naturalHeight || el.height;
+          if (!w || !h) {
+            const rect = el.getBoundingClientRect();
+            w = Math.round(rect.width);
+            h = Math.round(rect.height);
+          }
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(el, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/png');
+          if (dataUrl && dataUrl.startsWith('data:image/png')) {
+            return {
+              success: true,
+              dataUrl,
+              src: el.currentSrc || el.src || '',
+              width: w,
+              height: h,
+            };
+          }
+        } catch (canvasErr) {
+          return { success: false, reason: 'canvas_tainted', error: canvasErr.message };
+        }
+
+        return { success: false, reason: 'canvas_failed' };
+      }, idx);
+
+      if (canvasResult && canvasResult.success && canvasResult.dataUrl) {
+        const base64Data = canvasResult.dataUrl.split(',')[1];
+        fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+        const displayPath = path.relative(process.cwd(), filePath);
+        console.log(`💾 Saved via Offscreen Canvas: ${displayPath} (${canvasResult.width}x${canvasResult.height})`);
+        savedFiles.push(filePath);
+        saved = true;
+
+        if (canvasResult.src) {
+          knownImagesBeforePrompt.add(canvasResult.src);
+          knownImagesBeforePrompt.add(`${canvasResult.src}#${canvasResult.width}x${canvasResult.height}`);
+        }
+      } else {
+        console.log(`   ℹ️ Canvas extraction blocked by CORS (${canvasResult?.reason || 'failed'}). Falling back to fetch...`);
+      }
+    } catch (e) {
+      console.log(`   ⚠️ Canvas extraction error: ${e.message}`);
     }
 
-    if (targetImages.length > 0) {
-      for (let j = 0; j < targetImages.length; j++) {
-        const img = targetImages[j];
-        const filename = `prompt_${paddedIndex}_img_${j + 1}.png`;
-        const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
-
-        const base64Data = await page.evaluate(async (imgSrc) => {
-          if (imgSrc.startsWith('data:image/')) {
-            return imgSrc.split(',')[1];
+    // --- 2. In-Browser fetch(img.src) converted via FileReader ---
+    if (!saved) {
+      try {
+        const fetchResult = await page.evaluate(async (targetIdx) => {
+          function findTagged(root = document.body || document.documentElement, index) {
+            if (!root) return null;
+            if (root.querySelector) {
+              const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
+              if (el) return el;
+            }
+            if (root.shadowRoot) {
+              const found = findTagged(root.shadowRoot, index);
+              if (found) return found;
+            }
+            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+            for (const child of all) {
+              if (child.shadowRoot) {
+                const found = findTagged(child.shadowRoot, index);
+                if (found) return found;
+              }
+            }
+            return null;
           }
 
+          const el = findTagged(document.body || document.documentElement, targetIdx);
+          if (!el) return { success: false, reason: 'not_found' };
+
+          const src = el.currentSrc || el.src;
+          if (!src) return { success: false, reason: 'no_src' };
+
           try {
-            const res = await fetch(imgSrc, { credentials: 'include' });
+            const res = await fetch(src, { credentials: 'include' });
             const blob = await res.blob();
-            return new Promise((resolve, reject) => {
+            const dataUrl = await new Promise((resolve, reject) => {
               const reader = new FileReader();
-              reader.onloadend = () => {
-                const resUrl = reader.result;
-                resolve(resUrl.split(',')[1]);
-              };
+              reader.onloadend = () => resolve(reader.result);
               reader.onerror = reject;
               reader.readAsDataURL(blob);
             });
-          } catch (fetchErr) {
-            return null;
-          }
-        }, img.src);
 
-        if (base64Data) {
+            if (dataUrl && typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+              return {
+                success: true,
+                dataUrl,
+                src,
+                width: el.naturalWidth || el.width,
+                height: el.naturalHeight || el.height,
+              };
+            }
+          } catch (fetchErr) {
+            return { success: false, reason: 'fetch_failed', error: fetchErr.message };
+          }
+
+          return { success: false, reason: 'fetch_invalid_data' };
+        }, idx);
+
+        if (fetchResult && fetchResult.success && fetchResult.dataUrl) {
+          const base64Data = fetchResult.dataUrl.split(',')[1];
           fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
           const displayPath = path.relative(process.cwd(), filePath);
-          console.log(`💾 [Layer 2] Saved: ${displayPath}`);
+          console.log(`💾 Saved via Browser Fetch: ${displayPath}`);
           savedFiles.push(filePath);
+          saved = true;
+
+          if (fetchResult.src) {
+            knownImagesBeforePrompt.add(fetchResult.src);
+            knownImagesBeforePrompt.add(`${fetchResult.src}#${fetchResult.width}x${fetchResult.height}`);
+          }
+        } else {
+          console.log(`   ℹ️ Fetch fallback unavailable (${fetchResult?.reason || 'failed'}). Falling back to element screenshot...`);
         }
+      } catch (e) {
+        console.log(`   ⚠️ Fetch extraction error: ${e.message}`);
       }
-
-      if (savedFiles.length > 0) return savedFiles;
     }
-  } catch (err) {
-    console.log(`   ⚠️ Layer 2 note: ${err.message}`);
-  }
 
-  // ==========================================
-  // LAYER 3: Puppeteer Direct Element Screenshot (CORS-immune)
-  // ==========================================
-  console.log('🔍 [Layer 3] Direct element screenshot (100% CORS-immune compositor capture)...');
-  try {
-    const tagged = await page.evaluate(() => {
-      const candidates = Array.from(
-        document.querySelectorAll('img, [role="img"], [data-testid*="image"], [class*="card"], [class*="result"]')
-      ).filter((el) => {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return (
-          style.display !== 'none' &&
-          style.visibility !== 'hidden' &&
-          rect.width > 120 &&
-          rect.height > 120
-        );
-      });
+    // --- 3. Puppeteer Direct Element Screenshot (CORS-immune fallback) ---
+    if (!saved) {
+      try {
+        const handle = await page.evaluateHandle((targetIdx) => {
+          function findTagged(root = document.body || document.documentElement, index) {
+            if (!root) return null;
+            if (root.querySelector) {
+              const el = root.querySelector(`[data-flow-new-image-index="${index}"]`);
+              if (el) return el;
+            }
+            if (root.shadowRoot) {
+              const found = findTagged(root.shadowRoot, index);
+              if (found) return found;
+            }
+            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+            for (const child of all) {
+              if (child.shadowRoot) {
+                const found = findTagged(child.shadowRoot, index);
+                if (found) return found;
+              }
+            }
+            return null;
+          }
+          return findTagged(document.body || document.documentElement, targetIdx);
+        }, idx);
 
-      if (candidates.length > 0) {
-        const recent = candidates.slice(-3);
-        recent.forEach((el, idx) => {
-          el.setAttribute('data-bot-screenshot-target', String(idx));
-        });
-        return recent.length;
-      }
-      return 0;
-    });
-
-    if (tagged > 0) {
-      for (let k = 0; k < tagged; k++) {
-        const handle = await page.$(`[data-bot-screenshot-target="${k}"]`);
-        if (handle) {
-          const filename = `prompt_${paddedIndex}_img_${k + 1}.png`;
-          const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
-          await handle.scrollIntoView().catch(() => {});
-          await sleep(200);
-          await handle.screenshot({ path: filePath, type: 'png' });
+        const element = handle ? handle.asElement() : null;
+        if (element) {
+          await element.scrollIntoView().catch(() => {});
+          await sleep(150);
+          await element.screenshot({ path: filePath, type: 'png' });
           const displayPath = path.relative(process.cwd(), filePath);
-          console.log(`💾 [Layer 3] Saved via element screenshot: ${displayPath}`);
+          console.log(`💾 Saved via Element Screenshot: ${displayPath}`);
           savedFiles.push(filePath);
+          saved = true;
+        } else {
+          console.error(`❌ Could not locate element handle for image ${imgIndex}`);
+        }
+      } catch (e) {
+        console.error(`❌ Screenshot fallback error for image ${imgIndex}: ${e.message}`);
+      }
+    }
+
+    // Add metadata signatures to knownImagesBeforePrompt so future prompts ignore them
+    const itemMeta = tagResult[idx];
+    if (itemMeta && itemMeta.src) {
+      knownImagesBeforePrompt.add(itemMeta.src);
+      knownImagesBeforePrompt.add(`${itemMeta.src}#${itemMeta.width}x${itemMeta.height}`);
+      const clean = itemMeta.src.split('?')[0];
+      if (clean) knownImagesBeforePrompt.add(clean);
+    }
+  }
+
+  // Cleanup DOM tagging attributes
+  await page
+    .evaluate(() => {
+      function getAllElements(root = document.body || document.documentElement) {
+        const elements = [];
+        function recurse(node) {
+          if (!node) return;
+          elements.push(node);
+          if (node.shadowRoot) recurse(node.shadowRoot);
+          const children = node.children || node.childNodes || [];
+          for (const child of children) {
+            if (child.nodeType === 1) recurse(child);
+          }
+        }
+        recurse(root);
+        return elements;
+      }
+      for (const el of getAllElements()) {
+        if (el.hasAttribute && el.hasAttribute('data-flow-new-image-index')) {
+          el.removeAttribute('data-flow-new-image-index');
         }
       }
-      if (savedFiles.length > 0) return savedFiles;
-    }
-  } catch (err) {
-    console.log(`   ⚠️ Layer 3 note: ${err.message}`);
-  }
+    })
+    .catch(() => {});
 
-  // ==========================================
-  // LAYER 4: Intercepted Network Response Buffers
-  // ==========================================
-  console.log('🔍 [Layer 4] Inspecting intercepted network image responses...');
-  try {
-    if (promptNetworkImages.length > 0) {
-      const sortedImages = promptNetworkImages.sort((a, b) => b.size - a.size);
-      const topImages = sortedImages.slice(0, 3);
-
-      for (let k = 0; k < topImages.length; k++) {
-        const item = topImages[k];
-        const filename = `prompt_${paddedIndex}_img_${k + 1}.png`;
-        const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
-        fs.writeFileSync(filePath, item.buffer);
-        const displayPath = path.relative(process.cwd(), filePath);
-        console.log(
-          `💾 [Layer 4] Saved from network stream (${Math.round(item.size / 1024)} KB): ${displayPath}`
-        );
-        savedFiles.push(filePath);
-      }
-      if (savedFiles.length > 0) return savedFiles;
-    }
-  } catch (err) {
-    console.log(`   ⚠️ Layer 4 note: ${err.message}`);
-  }
-
-  // ==========================================
-  // LAYER 5: Fallback Viewport Area Screenshot
-  // ==========================================
-  console.log('🔍 [Layer 5] Viewport capture fallback...');
-  try {
-    const filename = `prompt_${paddedIndex}_img_1.png`;
-    const filePath = path.join(CONFIG.OUTPUT_DIR, filename);
-    await page.screenshot({ path: filePath, type: 'png' });
-    const displayPath = path.relative(process.cwd(), filePath);
-    console.log(`💾 [Layer 5] Saved viewport snapshot: ${displayPath}`);
-    savedFiles.push(filePath);
-    return savedFiles;
-  } catch (err) {
-    console.error(`❌ Could not save image for prompt #${promptNumber}: ${err.message}`);
-  }
-
+  deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
   return savedFiles;
 }
 
@@ -1458,6 +1689,11 @@ async function main() {
     // 8. 10-second workspace lock-in window before processing queue
     await waitForWorkspaceLockin(CONFIG.LOCKIN_BUFFER_SECONDS);
 
+    // Initialize session-wide known image signatures set & active zip prevention
+    const knownImagesBeforePrompt = new Set();
+    const zipWatcher = startZipWatcher(CONFIG.OUTPUT_DIR);
+    deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+
     // 9. Process prompts strictly in sequential order
     for (let i = 0; i < prompts.length; i++) {
       const promptNumber = i + 1;
@@ -1480,27 +1716,32 @@ async function main() {
         console.log('🧹 Clearing previous input text...');
         await hardClearInput(page, inputElement);
 
-        // Step 3: Snapshot existing DOM images and clear prompt response buffer
-        const baselineImages = await getDeepDOMImages(page);
-        const baselineFiles = getDirectoryFiles(CONFIG.OUTPUT_DIR);
-        promptNetworkImages = [];
-        console.log(`📸 Existing images on page baseline: ${baselineImages.length}`);
+        // Step 3: Strict Pre-Prompt Baseline Snapshot (Ignore Old Project Images)
+        deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
+        console.log('📸 Taking pre-prompt DOM baseline snapshot (recording all old project/history images to ignore)...');
+        const prePromptSignatures = await snapshotDOMImageSignatures(page);
+        for (const sig of prePromptSignatures) {
+          knownImagesBeforePrompt.add(sig);
+        }
+        console.log(`🔒 Baseline locked: ${knownImagesBeforePrompt.size} signatures recorded. Old/history images will be 100% ignored.`);
 
         // Step 4: Type current prompt & trigger 100% automatic generation
         console.log('⌨️  Typing prompt and triggering 100% automatic submission...');
         await typeAndTriggerPrompt(page, inputElement, promptText);
 
-        // Step 5: Smart wait for generation completion
-        await waitForGenerationToFinish(page, baselineImages.length);
+        // Step 5: Wait specifically for the 3 new images of the current prompt
+        await waitForNewImagesOfPrompt(page, knownImagesBeforePrompt, CONFIG.GENERATION_TIMEOUT_MS);
 
-        // Step 6: Multi-layered image extraction & save into timestamped session folder
-        const savedFiles = await captureAndSaveGeneratedImages(
+        // Step 6: Direct Individual PNG Extraction (All 3 Images, Flat Folder, No ZIP)
+        const savedFiles = await extractAndSaveNewImages(
           page,
-          baselineImages,
-          baselineFiles,
+          knownImagesBeforePrompt,
           promptNumber
         );
-        console.log(`🎉 Successfully saved ${savedFiles.length} image(s) for prompt #${promptNumber}!`);
+        console.log(`🎉 Successfully saved ${savedFiles.length}/3 image(s) for prompt #${promptNumber}!`);
+
+        // Final sanity cleanup of any zip files
+        deleteAnyZipFiles(CONFIG.OUTPUT_DIR);
 
         // Step 7: Cooldown & continue
         console.log(`⏱️  Cooling down for ${CONFIG.COOLDOWN_MS / 1000}s...`);
@@ -1513,6 +1754,7 @@ async function main() {
         await sleep(3000);
       }
     }
+
 
     console.log('\n======================================================================');
     console.log(`🎉 ALL ${prompts.length} PROMPTS PROCESSED SUCCESSFULLY!`);

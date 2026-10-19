@@ -6,11 +6,17 @@
   "scripts": {
     "start": "node bot.js"
   },
-  "keywords": ["puppeteer", "google-flow", "automation", "image-generation"],
+  "keywords": [
+    "puppeteer",
+    "google-flow",
+    "automation",
+    "image-generation"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "adm-zip": "^0.6.1",
     "puppeteer": "^25.14.0"
   }
 }
